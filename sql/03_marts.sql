@@ -1,0 +1,195 @@
+/* ============================================================================
+   03_marts.sql  -  MARTS layer (dimensional model)
+   Run as LOGISTICS_ENGINEER, after 02_staging.sql.
+
+   Star schema
+     DIM_HUB, DIM_CUSTOMER, DIM_DRIVER, DIM_VEHICLE, DIM_DATE
+     FCT_SHIPMENT   grain: one row per shipment (lifecycle pivoted from events)
+     FCT_HUB_DAILY  grain: one row per hub per day (volume, SLA and capacity KPIs)
+
+   The whole layer is rebuilt by OPS.SP_BUILD_MARTS(). A full rebuild is a
+   deliberate trade-off: at ~100k shipments it takes seconds, it is trivially
+   correct, and it automatically absorbs late-arriving events. At larger scale
+   this would become an incremental MERGE or a DYNAMIC TABLE (see README).
+   ========================================================================== */
+
+USE ROLE LOGISTICS_ENGINEER;
+USE WAREHOUSE LOGISTICS_WH;
+USE SCHEMA LOGISTICS_DB.OPS;
+
+CREATE OR REPLACE PROCEDURE SP_BUILD_MARTS()
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+$$
+BEGIN
+  -- ---------------------------------------------------------------- dimensions
+  CREATE OR REPLACE TABLE LOGISTICS_DB.MARTS.DIM_HUB AS
+  SELECT HUB_ID, HUB_CODE, CITY, COUNTY, REGION, LATITUDE, LONGITUDE, CAPACITY_PER_DAY
+  FROM LOGISTICS_DB.STAGING.STG_HUBS;
+
+  CREATE OR REPLACE TABLE LOGISTICS_DB.MARTS.DIM_CUSTOMER AS
+  SELECT c.CUSTOMER_ID, c.CUSTOMER_NAME, c.SEGMENT, c.HOME_HUB_ID, h.HUB_CODE AS HOME_HUB_CODE,
+         c.CONTRACT_SLA_HOURS, c.ONBOARDED_DATE
+  FROM LOGISTICS_DB.STAGING.STG_CUSTOMERS c
+  LEFT JOIN LOGISTICS_DB.STAGING.STG_HUBS h ON h.HUB_ID = c.HOME_HUB_ID;
+
+  CREATE OR REPLACE TABLE LOGISTICS_DB.MARTS.DIM_DRIVER AS
+  SELECT d.DRIVER_ID, d.FULL_NAME, d.HUB_ID, h.HUB_CODE, d.HIRE_DATE, d.LICENSE_CATEGORY, d.IS_ACTIVE
+  FROM LOGISTICS_DB.STAGING.STG_DRIVERS d
+  LEFT JOIN LOGISTICS_DB.STAGING.STG_HUBS h ON h.HUB_ID = d.HUB_ID;
+
+  CREATE OR REPLACE TABLE LOGISTICS_DB.MARTS.DIM_VEHICLE AS
+  SELECT v.VEHICLE_ID, v.PLATE_NUMBER, v.VEHICLE_TYPE, v.CAPACITY_KG, v.HUB_ID, h.HUB_CODE, v.FUEL_TYPE, v.STATUS
+  FROM LOGISTICS_DB.STAGING.STG_VEHICLES v
+  LEFT JOIN LOGISTICS_DB.STAGING.STG_HUBS h ON h.HUB_ID = v.HUB_ID;
+
+  CREATE OR REPLACE TABLE LOGISTICS_DB.MARTS.DIM_DATE AS
+  SELECT
+    DATE_DAY,
+    YEAR(DATE_DAY)              AS YEAR,
+    QUARTER(DATE_DAY)           AS QUARTER,
+    MONTH(DATE_DAY)             AS MONTH,
+    MONTHNAME(DATE_DAY)         AS MONTH_NAME,
+    WEEKISO(DATE_DAY)           AS ISO_WEEK,
+    DAYOFWEEKISO(DATE_DAY)      AS ISO_DAY_OF_WEEK,   -- 1 = Monday
+    DAYNAME(DATE_DAY)           AS DAY_NAME,
+    (DAYOFWEEKISO(DATE_DAY) >= 6) AS IS_WEEKEND
+  FROM (
+    -- SEQ4() alone may skip values (Snowflake does not guarantee a gap-free sequence).
+    -- A missing date would break the hub x day spine the forecast needs, so number the rows explicitly.
+    SELECT DATEADD('day', ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1, '2025-01-01'::DATE) AS DATE_DAY
+    FROM TABLE(GENERATOR(ROWCOUNT => 1500))
+  );
+
+  -- ---------------------------------------------------------------- fact: shipment
+  CREATE OR REPLACE TABLE LOGISTICS_DB.MARTS.FCT_SHIPMENT AS
+  WITH ev AS (
+    SELECT
+      SHIPMENT_ID,
+      MIN(IFF(EVENT_TYPE = 'PICKED_UP',           EVENT_TS, NULL)) AS PICKED_UP_AT,
+      MIN(IFF(EVENT_TYPE = 'OUT_FOR_DELIVERY',    EVENT_TS, NULL)) AS FIRST_OUT_FOR_DELIVERY_AT,
+      MIN(IFF(EVENT_TYPE = 'DELIVERED',           EVENT_TS, NULL)) AS DELIVERED_AT,
+      MIN(IFF(EVENT_TYPE = 'RETURNED_TO_SENDER',  EVENT_TS, NULL)) AS RETURNED_AT,
+      COUNT_IF(EVENT_TYPE = 'OUT_FOR_DELIVERY')                    AS DELIVERY_ATTEMPTS,
+      COUNT_IF(EVENT_TYPE = 'ATTEMPT_FAILED')                      AS FAILED_ATTEMPTS,
+      MAX_BY(FAILURE_REASON, IFF(EVENT_TYPE = 'ATTEMPT_FAILED', EVENT_TS, NULL))   AS LAST_FAILURE_REASON,
+      MAX_BY(DRIVER_ID,      IFF(EVENT_TYPE = 'OUT_FOR_DELIVERY', EVENT_TS, NULL)) AS LAST_DRIVER_ID
+    FROM LOGISTICS_DB.STAGING.STG_SHIPMENT_EVENTS
+    GROUP BY SHIPMENT_ID
+  )
+  SELECT
+    s.SHIPMENT_ID,
+    s.CUSTOMER_ID,
+    s.ORIGIN_HUB_ID,
+    s.DESTINATION_HUB_ID,
+    s.DESTINATION_CITY,
+    s.DESTINATION_ZONE,
+    s.SERVICE_LEVEL,
+    s.WEIGHT_KG,
+    s.DECLARED_VALUE_RON,
+    s.COD_AMOUNT_RON,
+    s.IS_COD,
+    s.CREATED_AT,
+    s.CREATED_AT::DATE                         AS CREATED_DATE,
+    s.PROMISED_DELIVERY_DATE,
+    e.PICKED_UP_AT,
+    e.FIRST_OUT_FOR_DELIVERY_AT,
+    e.DELIVERED_AT,
+    e.DELIVERED_AT::DATE                       AS DELIVERED_DATE,
+    e.RETURNED_AT,
+    COALESCE(e.DELIVERY_ATTEMPTS, 0)           AS DELIVERY_ATTEMPTS,
+    COALESCE(e.FAILED_ATTEMPTS, 0)             AS FAILED_ATTEMPTS,
+    e.LAST_FAILURE_REASON,
+    e.LAST_DRIVER_ID,
+    CASE
+      WHEN e.DELIVERED_AT IS NOT NULL THEN 'DELIVERED'
+      WHEN e.RETURNED_AT  IS NOT NULL THEN 'RETURNED'
+      ELSE 'IN_TRANSIT'
+    END                                        AS STATUS,
+    DATEDIFF('minute', s.CREATED_AT, e.DELIVERED_AT) / 60.0                       AS TRANSIT_HOURS,
+    IFF(e.DELIVERED_AT IS NOT NULL, e.DELIVERED_AT::DATE <= s.PROMISED_DELIVERY_DATE, NULL) AS IS_ON_TIME,
+    IFF(e.DELIVERED_AT IS NOT NULL,
+        GREATEST(DATEDIFF('day', s.PROMISED_DELIVERY_DATE, e.DELIVERED_AT::DATE), 0), NULL) AS DAYS_LATE,
+    (e.DELIVERED_AT IS NOT NULL AND COALESCE(e.FAILED_ATTEMPTS, 0) = 0)           AS IS_FIRST_ATTEMPT_DELIVERY
+  FROM LOGISTICS_DB.STAGING.STG_SHIPMENTS s
+  LEFT JOIN ev e ON e.SHIPMENT_ID = s.SHIPMENT_ID;
+
+  -- ---------------------------------------------------------------- fact: hub per day
+  -- "created" metrics belong to the ORIGIN hub on the creation date,
+  -- "delivered" metrics to the DESTINATION hub on the delivery date.
+  CREATE OR REPLACE TABLE LOGISTICS_DB.MARTS.FCT_HUB_DAILY AS
+  WITH bounds AS (
+    SELECT MIN(CREATED_DATE) AS MIN_DAY, MAX(CREATED_DATE) AS MAX_DAY
+    FROM LOGISTICS_DB.MARTS.FCT_SHIPMENT
+  ),
+  created AS (
+    SELECT ORIGIN_HUB_ID AS HUB_ID, CREATED_DATE AS DATE_DAY,
+           COUNT(*)                           AS SHIPMENTS_CREATED,
+           SUM(WEIGHT_KG)                     AS WEIGHT_KG_CREATED,
+           COUNT_IF(SERVICE_LEVEL = 'EXPRESS') AS EXPRESS_CREATED,
+           COUNT_IF(IS_COD)                   AS COD_CREATED
+    FROM LOGISTICS_DB.MARTS.FCT_SHIPMENT
+    GROUP BY 1, 2
+  ),
+  delivered AS (
+    SELECT DESTINATION_HUB_ID AS HUB_ID, DELIVERED_DATE AS DATE_DAY,
+           COUNT(*)                                AS SHIPMENTS_DELIVERED,
+           COUNT_IF(IS_ON_TIME)                    AS DELIVERED_ON_TIME,
+           COUNT_IF(IS_FIRST_ATTEMPT_DELIVERY)     AS DELIVERED_FIRST_ATTEMPT,
+           AVG(TRANSIT_HOURS)                      AS AVG_TRANSIT_HOURS
+    FROM LOGISTICS_DB.MARTS.FCT_SHIPMENT
+    WHERE STATUS = 'DELIVERED'
+    GROUP BY 1, 2
+  ),
+  failed AS (
+    SELECT HUB_ID, EVENT_TS::DATE AS DATE_DAY, COUNT(*) AS FAILED_ATTEMPTS
+    FROM LOGISTICS_DB.STAGING.STG_SHIPMENT_EVENTS
+    WHERE EVENT_TYPE = 'ATTEMPT_FAILED'
+    GROUP BY 1, 2
+  )
+  SELECT
+    h.HUB_ID,
+    h.HUB_CODE,
+    d.DATE_DAY,
+    h.CAPACITY_PER_DAY,
+    COALESCE(c.SHIPMENTS_CREATED, 0)                             AS SHIPMENTS_CREATED,
+    COALESCE(c.WEIGHT_KG_CREATED, 0)                             AS WEIGHT_KG_CREATED,
+    COALESCE(c.EXPRESS_CREATED, 0)                               AS EXPRESS_CREATED,
+    COALESCE(c.COD_CREATED, 0)                                   AS COD_CREATED,
+    ROUND(COALESCE(c.SHIPMENTS_CREATED, 0) / h.CAPACITY_PER_DAY, 3) AS CAPACITY_UTILISATION,
+    COALESCE(x.SHIPMENTS_DELIVERED, 0)                           AS SHIPMENTS_DELIVERED,
+    COALESCE(x.DELIVERED_ON_TIME, 0)                             AS DELIVERED_ON_TIME,
+    COALESCE(x.DELIVERED_FIRST_ATTEMPT, 0)                       AS DELIVERED_FIRST_ATTEMPT,
+    COALESCE(x.SHIPMENTS_DELIVERED, 0) - COALESCE(x.DELIVERED_ON_TIME, 0) AS LATE_DELIVERIES,
+    IFF(COALESCE(x.SHIPMENTS_DELIVERED, 0) = 0, NULL,
+        ROUND(x.DELIVERED_ON_TIME / x.SHIPMENTS_DELIVERED, 4))   AS ON_TIME_RATE,
+    ROUND(x.AVG_TRANSIT_HOURS, 2)                                AS AVG_TRANSIT_HOURS,
+    COALESCE(f.FAILED_ATTEMPTS, 0)                               AS FAILED_ATTEMPTS
+  FROM LOGISTICS_DB.MARTS.DIM_HUB h
+  CROSS JOIN bounds b
+  JOIN LOGISTICS_DB.MARTS.DIM_DATE d ON d.DATE_DAY BETWEEN b.MIN_DAY AND b.MAX_DAY
+  LEFT JOIN created   c ON c.HUB_ID = h.HUB_ID AND c.DATE_DAY = d.DATE_DAY
+  LEFT JOIN delivered x ON x.HUB_ID = h.HUB_ID AND x.DATE_DAY = d.DATE_DAY
+  LEFT JOIN failed    f ON f.HUB_ID = h.HUB_ID AND f.DATE_DAY = d.DATE_DAY;
+
+  -- ---------------------------------------------------------------- log
+  LET n_ship NUMBER := (SELECT COUNT(*) FROM LOGISTICS_DB.MARTS.FCT_SHIPMENT);
+  INSERT INTO LOGISTICS_DB.OPS.PIPELINE_RUN_LOG (PIPELINE_STEP, ROWS_AFFECTED) VALUES ('BUILD_MARTS', :n_ship);
+  RETURN 'marts rebuilt, shipments: ' || TO_VARCHAR(n_ship);
+END;
+$$;
+
+-- First build ------------------------------------------------------------------------
+CALL LOGISTICS_DB.OPS.SP_BUILD_MARTS();
+
+-- Quick look ----------------------------------------------------------------------------
+SELECT STATUS, COUNT(*) AS SHIPMENTS,
+       ROUND(AVG(IFF(IS_ON_TIME, 1, 0)) * 100, 1) AS ON_TIME_PCT
+FROM LOGISTICS_DB.MARTS.FCT_SHIPMENT
+GROUP BY STATUS;
+
+SELECT * FROM LOGISTICS_DB.MARTS.FCT_HUB_DAILY
+WHERE HUB_CODE = 'BUC'
+ORDER BY DATE_DAY DESC
+LIMIT 10;
